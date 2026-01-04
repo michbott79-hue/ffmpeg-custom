@@ -1923,8 +1923,58 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
     pls->ctx->pb = &pls->pb.pub;
     pls->ctx->io_open  = nested_io_open;
 
-    if (c->cenc_decryption_key)
-        av_dict_set(&in_fmt_opts, "decryption_key", c->cenc_decryption_key, 0);
+    /* Parse multi-key format: KID1:KEY1,KID2:KEY2 or single KEY */
+    if (c->cenc_decryption_key) {
+        char *keys_str = av_strdup(c->cenc_decryption_key);
+        char *saveptr = NULL;
+        char *pair;
+        int first_key = 1;
+        AVDictionary *keys_dict = NULL;
+
+        if (keys_str) {
+            pair = av_strtok(keys_str, ",", &saveptr);
+            while (pair) {
+                char *colon = strchr(pair, ':');
+                if (colon && (colon - pair) == 32) {
+                    /* Multi-key format: KID:KEY */
+                    char kid[33] = {0};
+                    char *key_hex = colon + 1;
+
+                    memcpy(kid, pair, 32);
+                    kid[32] = '\0';
+                    /* Lowercase for matching */
+                    for (int k = 0; k < 32; k++)
+                        kid[k] = av_tolower(kid[k]);
+                    av_dict_set(&keys_dict, kid, key_hex, 0);
+                    if (first_key) {
+                        av_dict_set(&in_fmt_opts, "decryption_key", key_hex, 0);
+                        first_key = 0;
+                    }
+                } else if (first_key && strlen(pair) == 32) {
+                    /* Single key format (32 hex chars) */
+                    av_dict_set(&in_fmt_opts, "decryption_key", pair, 0);
+                    first_key = 0;
+                }
+                pair = av_strtok(NULL, ",", &saveptr);
+            }
+
+            /* Build decryption_keys string for mov demuxer */
+            if (keys_dict) {
+                const AVDictionaryEntry *e = NULL;
+                char keys_opt[4096] = {0};
+                int pos = 0;
+                while ((e = av_dict_iterate(keys_dict, e))) {
+                    if (pos > 0)
+                        pos += snprintf(keys_opt + pos, sizeof(keys_opt) - pos, ",");
+                    pos += snprintf(keys_opt + pos, sizeof(keys_opt) - pos, "%s:%s", e->key, e->value);
+                }
+                if (pos > 0)
+                    av_dict_set(&in_fmt_opts, "decryption_keys", keys_opt, 0);
+                av_dict_free(&keys_dict);
+            }
+            av_freep(&keys_str);
+        }
+    }
 
     // provide additional information from mpd if available
     ret = avformat_open_input(&pls->ctx, "", in_fmt, &in_fmt_opts); //pls->init_section->url
@@ -2366,7 +2416,7 @@ static const AVOption dash_options[] = {
         OFFSET(allowed_extensions), AV_OPT_TYPE_STRING,
         {.str = "aac,m4a,m4s,m4v,mov,mp4,webm,ts"},
         INT_MIN, INT_MAX, FLAGS},
-    { "cenc_decryption_key", "Media decryption key (hex)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+    { "cenc_decryption_key", "Media decryption key (hex or KID:KEY,KID2:KEY2 format)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     {NULL}
 };
 

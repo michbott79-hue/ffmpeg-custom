@@ -8130,10 +8130,63 @@ static int mov_read_dfla(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     return 0;
 }
 
+/**
+ * Get decryption key for a sample based on its KID.
+ * Looks up key in decryption_keys dictionary, falls back to default decryption_key.
+ * @param out     Buffer to store the key
+ * @param len     Expected key length (typically 16 for AES-128)
+ * @param c       MOVContext with decryption keys
+ * @param sample  Encryption info with KID
+ * @return 0 on success, negative error code on failure
+ */
+static int get_key_from_kid(uint8_t *out, int len, MOVContext *c, AVEncryptionInfo *sample)
+{
+    char kid_hex[33];
+    const AVDictionaryEntry *entry;
+    int i;
+
+    if (!out || len <= 0)
+        return AVERROR(EINVAL);
+
+    /* Try to find key in dictionary by KID */
+    if (c->decryption_keys && sample && sample->key_id && sample->key_id_size >= 16) {
+        for (i = 0; i < 16; i++)
+            snprintf(kid_hex + i * 2, 3, "%02x", sample->key_id[i]);
+        kid_hex[32] = '\0';
+
+        entry = av_dict_get(c->decryption_keys, kid_hex, NULL, AV_DICT_IGNORE_SUFFIX);
+        if (entry && entry->value && strlen(entry->value) == (size_t)(len * 2)) {
+            for (i = 0; i < len; i++) {
+                unsigned int byte_val;
+                if (sscanf(entry->value + i * 2, "%2x", &byte_val) != 1)
+                    return AVERROR(EINVAL);
+                out[i] = (uint8_t)byte_val;
+            }
+            av_log(c->fc, AV_LOG_DEBUG, "Multi-key: using key for KID=%s\n", kid_hex);
+            return 0;
+        }
+    }
+
+    /* Fall back to default key */
+    if (c->decryption_key && c->decryption_key_len == len) {
+        memcpy(out, c->decryption_key, len);
+        return 0;
+    }
+
+    av_log(c->fc, AV_LOG_ERROR, "No decryption key found for sample\n");
+    return AVERROR(EINVAL);
+}
+
 static int cenc_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryptionInfo *sample, uint8_t *input, int size)
 {
     int i, ret;
     int bytes_of_protected_data;
+    uint8_t key[16];
+
+    /* Get key (multi-key or single key) */
+    ret = get_key_from_kid(key, 16, c, sample);
+    if (ret < 0)
+        return ret;
 
     if (!sc->cenc.aes_ctr) {
         /* initialize the cipher */
@@ -8141,11 +8194,12 @@ static int cenc_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
         if (!sc->cenc.aes_ctr) {
             return AVERROR(ENOMEM);
         }
+    }
 
-        ret = av_aes_ctr_init(sc->cenc.aes_ctr, c->decryption_key);
-        if (ret < 0) {
-            return ret;
-        }
+    /* Always reinit with correct key for this sample (multi-key support) */
+    ret = av_aes_ctr_init(sc->cenc.aes_ctr, key);
+    if (ret < 0) {
+        return ret;
     }
 
     av_aes_ctr_set_full_iv(sc->cenc.aes_ctr, sample->iv);
@@ -8188,6 +8242,12 @@ static int cbc1_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
     int i, ret;
     int num_of_encrypted_blocks;
     uint8_t iv[16];
+    uint8_t key[16];
+
+    /* Get key (multi-key or single key) */
+    ret = get_key_from_kid(key, 16, c, sample);
+    if (ret < 0)
+        return ret;
 
     if (!sc->cenc.aes_ctx) {
         /* initialize the cipher */
@@ -8195,11 +8255,12 @@ static int cbc1_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
         if (!sc->cenc.aes_ctx) {
             return AVERROR(ENOMEM);
         }
+    }
 
-        ret = av_aes_init(sc->cenc.aes_ctx, c->decryption_key, 16 * 8, 1);
-        if (ret < 0) {
-            return ret;
-        }
+    /* Always reinit with correct key for this sample (multi-key support) */
+    ret = av_aes_init(sc->cenc.aes_ctx, key, 16 * 8, 1);
+    if (ret < 0) {
+        return ret;
     }
 
     memcpy(iv, sample->iv, 16);
@@ -8247,6 +8308,12 @@ static int cens_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
 {
     int i, ret, rem_bytes;
     uint8_t *data;
+    uint8_t key[16];
+
+    /* Get key (multi-key or single key) */
+    ret = get_key_from_kid(key, 16, c, sample);
+    if (ret < 0)
+        return ret;
 
     if (!sc->cenc.aes_ctr) {
         /* initialize the cipher */
@@ -8254,11 +8321,12 @@ static int cens_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
         if (!sc->cenc.aes_ctr) {
             return AVERROR(ENOMEM);
         }
+    }
 
-        ret = av_aes_ctr_init(sc->cenc.aes_ctr, c->decryption_key);
-        if (ret < 0) {
-            return ret;
-        }
+    /* Always reinit with correct key for this sample (multi-key support) */
+    ret = av_aes_ctr_init(sc->cenc.aes_ctr, key);
+    if (ret < 0) {
+        return ret;
     }
 
     av_aes_ctr_set_full_iv(sc->cenc.aes_ctr, sample->iv);
@@ -8313,6 +8381,12 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
     int i, ret, rem_bytes;
     uint8_t iv[16];
     uint8_t *data;
+    uint8_t key[16];
+
+    /* Get key (multi-key or single key) */
+    ret = get_key_from_kid(key, 16, c, sample);
+    if (ret < 0)
+        return ret;
 
     if (!sc->cenc.aes_ctx) {
         /* initialize the cipher */
@@ -8320,11 +8394,12 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
         if (!sc->cenc.aes_ctx) {
             return AVERROR(ENOMEM);
         }
+    }
 
-        ret = av_aes_init(sc->cenc.aes_ctx, c->decryption_key, 16 * 8, 1);
-        if (ret < 0) {
-            return ret;
-        }
+    /* Always reinit with correct key for this sample (multi-key support) */
+    ret = av_aes_init(sc->cenc.aes_ctx, key, 16 * 8, 1);
+    if (ret < 0) {
+        return ret;
     }
 
     /* whole-block full sample encryption */
@@ -11650,6 +11725,7 @@ static const AVOption mov_options[] = {
         AV_OPT_TYPE_BINARY, {.str="77214d4b196a87cd520045fd20a51d67"},
         .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "decryption_key", "The media decryption key (hex)", OFFSET(decryption_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { "decryption_keys", "Multi-key decryption (KID:KEY,KID2:KEY2 format)", OFFSET(decryption_keys), AV_OPT_TYPE_DICT, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "enable_drefs", "Enable external track support.", OFFSET(enable_drefs), AV_OPT_TYPE_BOOL,
         {.i64 = 0}, 0, 1, FLAGS },
     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },

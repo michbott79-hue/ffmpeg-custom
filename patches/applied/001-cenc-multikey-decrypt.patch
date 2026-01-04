@@ -1,0 +1,269 @@
+diff --git a/ffmpeg/libavformat/dashdec.c b/ffmpeg/libavformat/dashdec.c
+index 500d8ca..8b4f068 100644
+--- a/ffmpeg/libavformat/dashdec.c
++++ b/ffmpeg/libavformat/dashdec.c
+@@ -1923,8 +1923,58 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation
+     pls->ctx->pb = &pls->pb.pub;
+     pls->ctx->io_open  = nested_io_open;
+ 
+-    if (c->cenc_decryption_key)
+-        av_dict_set(&in_fmt_opts, "decryption_key", c->cenc_decryption_key, 0);
++    /* Parse multi-key format: KID1:KEY1,KID2:KEY2 or single KEY */
++    if (c->cenc_decryption_key) {
++        char *keys_str = av_strdup(c->cenc_decryption_key);
++        char *saveptr = NULL;
++        char *pair;
++        int first_key = 1;
++        AVDictionary *keys_dict = NULL;
++
++        if (keys_str) {
++            pair = av_strtok(keys_str, ",", &saveptr);
++            while (pair) {
++                char *colon = strchr(pair, ':');
++                if (colon && (colon - pair) == 32) {
++                    /* Multi-key format: KID:KEY */
++                    char kid[33] = {0};
++                    char *key_hex = colon + 1;
++
++                    memcpy(kid, pair, 32);
++                    kid[32] = '\0';
++                    /* Lowercase for matching */
++                    for (int k = 0; k < 32; k++)
++                        kid[k] = av_tolower(kid[k]);
++                    av_dict_set(&keys_dict, kid, key_hex, 0);
++                    if (first_key) {
++                        av_dict_set(&in_fmt_opts, "decryption_key", key_hex, 0);
++                        first_key = 0;
++                    }
++                } else if (first_key && strlen(pair) == 32) {
++                    /* Single key format (32 hex chars) */
++                    av_dict_set(&in_fmt_opts, "decryption_key", pair, 0);
++                    first_key = 0;
++                }
++                pair = av_strtok(NULL, ",", &saveptr);
++            }
++
++            /* Build decryption_keys string for mov demuxer */
++            if (keys_dict) {
++                const AVDictionaryEntry *e = NULL;
++                char keys_opt[4096] = {0};
++                int pos = 0;
++                while ((e = av_dict_iterate(keys_dict, e))) {
++                    if (pos > 0)
++                        pos += snprintf(keys_opt + pos, sizeof(keys_opt) - pos, ",");
++                    pos += snprintf(keys_opt + pos, sizeof(keys_opt) - pos, "%s:%s", e->key, e->value);
++                }
++                if (pos > 0)
++                    av_dict_set(&in_fmt_opts, "decryption_keys", keys_opt, 0);
++                av_dict_free(&keys_dict);
++            }
++            av_freep(&keys_str);
++        }
++    }
+ 
+     // provide additional information from mpd if available
+     ret = avformat_open_input(&pls->ctx, "", in_fmt, &in_fmt_opts); //pls->init_section->url
+@@ -2366,7 +2416,7 @@ static const AVOption dash_options[] = {
+         OFFSET(allowed_extensions), AV_OPT_TYPE_STRING,
+         {.str = "aac,m4a,m4s,m4v,mov,mp4,webm,ts"},
+         INT_MIN, INT_MAX, FLAGS},
+-    { "cenc_decryption_key", "Media decryption key (hex)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
++    { "cenc_decryption_key", "Media decryption key (hex or KID:KEY,KID2:KEY2 format)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+     {NULL}
+ };
+ 
+diff --git a/ffmpeg/libavformat/isom.h b/ffmpeg/libavformat/isom.h
+index 55bc282..063e943 100644
+--- a/ffmpeg/libavformat/isom.h
++++ b/ffmpeg/libavformat/isom.h
+@@ -372,6 +372,7 @@ typedef struct MOVContext {
+     struct AVAES *aes_decrypt;
+     uint8_t *decryption_key;
+     int decryption_key_len;
++    AVDictionary *decryption_keys;  /* KID => KEY dictionary for multi-key CENC */
+     int enable_drefs;
+     int32_t movie_display_matrix[3][3]; ///< display matrix from mvhd
+     int have_read_mfra_size;
+diff --git a/ffmpeg/libavformat/mov.c b/ffmpeg/libavformat/mov.c
+index 009ddfe..8f5fdef 100644
+--- a/ffmpeg/libavformat/mov.c
++++ b/ffmpeg/libavformat/mov.c
+@@ -8130,10 +8130,63 @@ static int mov_read_dfla(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+     return 0;
+ }
+ 
++/**
++ * Get decryption key for a sample based on its KID.
++ * Looks up key in decryption_keys dictionary, falls back to default decryption_key.
++ * @param out     Buffer to store the key
++ * @param len     Expected key length (typically 16 for AES-128)
++ * @param c       MOVContext with decryption keys
++ * @param sample  Encryption info with KID
++ * @return 0 on success, negative error code on failure
++ */
++static int get_key_from_kid(uint8_t *out, int len, MOVContext *c, AVEncryptionInfo *sample)
++{
++    char kid_hex[33];
++    const AVDictionaryEntry *entry;
++    int i;
++
++    if (!out || len <= 0)
++        return AVERROR(EINVAL);
++
++    /* Try to find key in dictionary by KID */
++    if (c->decryption_keys && sample && sample->key_id && sample->key_id_size >= 16) {
++        for (i = 0; i < 16; i++)
++            snprintf(kid_hex + i * 2, 3, "%02x", sample->key_id[i]);
++        kid_hex[32] = '\0';
++
++        entry = av_dict_get(c->decryption_keys, kid_hex, NULL, AV_DICT_IGNORE_SUFFIX);
++        if (entry && entry->value && strlen(entry->value) == (size_t)(len * 2)) {
++            for (i = 0; i < len; i++) {
++                unsigned int byte_val;
++                if (sscanf(entry->value + i * 2, "%2x", &byte_val) != 1)
++                    return AVERROR(EINVAL);
++                out[i] = (uint8_t)byte_val;
++            }
++            av_log(c->fc, AV_LOG_DEBUG, "Multi-key: using key for KID=%s\n", kid_hex);
++            return 0;
++        }
++    }
++
++    /* Fall back to default key */
++    if (c->decryption_key && c->decryption_key_len == len) {
++        memcpy(out, c->decryption_key, len);
++        return 0;
++    }
++
++    av_log(c->fc, AV_LOG_ERROR, "No decryption key found for sample\n");
++    return AVERROR(EINVAL);
++}
++
+ static int cenc_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryptionInfo *sample, uint8_t *input, int size)
+ {
+     int i, ret;
+     int bytes_of_protected_data;
++    uint8_t key[16];
++
++    /* Get key (multi-key or single key) */
++    ret = get_key_from_kid(key, 16, c, sample);
++    if (ret < 0)
++        return ret;
+ 
+     if (!sc->cenc.aes_ctr) {
+         /* initialize the cipher */
+@@ -8141,11 +8194,12 @@ static int cenc_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
+         if (!sc->cenc.aes_ctr) {
+             return AVERROR(ENOMEM);
+         }
++    }
+ 
+-        ret = av_aes_ctr_init(sc->cenc.aes_ctr, c->decryption_key);
+-        if (ret < 0) {
+-            return ret;
+-        }
++    /* Always reinit with correct key for this sample (multi-key support) */
++    ret = av_aes_ctr_init(sc->cenc.aes_ctr, key);
++    if (ret < 0) {
++        return ret;
+     }
+ 
+     av_aes_ctr_set_full_iv(sc->cenc.aes_ctr, sample->iv);
+@@ -8188,6 +8242,12 @@ static int cbc1_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
+     int i, ret;
+     int num_of_encrypted_blocks;
+     uint8_t iv[16];
++    uint8_t key[16];
++
++    /* Get key (multi-key or single key) */
++    ret = get_key_from_kid(key, 16, c, sample);
++    if (ret < 0)
++        return ret;
+ 
+     if (!sc->cenc.aes_ctx) {
+         /* initialize the cipher */
+@@ -8195,11 +8255,12 @@ static int cbc1_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
+         if (!sc->cenc.aes_ctx) {
+             return AVERROR(ENOMEM);
+         }
++    }
+ 
+-        ret = av_aes_init(sc->cenc.aes_ctx, c->decryption_key, 16 * 8, 1);
+-        if (ret < 0) {
+-            return ret;
+-        }
++    /* Always reinit with correct key for this sample (multi-key support) */
++    ret = av_aes_init(sc->cenc.aes_ctx, key, 16 * 8, 1);
++    if (ret < 0) {
++        return ret;
+     }
+ 
+     memcpy(iv, sample->iv, 16);
+@@ -8247,6 +8308,12 @@ static int cens_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
+ {
+     int i, ret, rem_bytes;
+     uint8_t *data;
++    uint8_t key[16];
++
++    /* Get key (multi-key or single key) */
++    ret = get_key_from_kid(key, 16, c, sample);
++    if (ret < 0)
++        return ret;
+ 
+     if (!sc->cenc.aes_ctr) {
+         /* initialize the cipher */
+@@ -8254,11 +8321,12 @@ static int cens_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
+         if (!sc->cenc.aes_ctr) {
+             return AVERROR(ENOMEM);
+         }
++    }
+ 
+-        ret = av_aes_ctr_init(sc->cenc.aes_ctr, c->decryption_key);
+-        if (ret < 0) {
+-            return ret;
+-        }
++    /* Always reinit with correct key for this sample (multi-key support) */
++    ret = av_aes_ctr_init(sc->cenc.aes_ctr, key);
++    if (ret < 0) {
++        return ret;
+     }
+ 
+     av_aes_ctr_set_full_iv(sc->cenc.aes_ctr, sample->iv);
+@@ -8313,6 +8381,12 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
+     int i, ret, rem_bytes;
+     uint8_t iv[16];
+     uint8_t *data;
++    uint8_t key[16];
++
++    /* Get key (multi-key or single key) */
++    ret = get_key_from_kid(key, 16, c, sample);
++    if (ret < 0)
++        return ret;
+ 
+     if (!sc->cenc.aes_ctx) {
+         /* initialize the cipher */
+@@ -8320,11 +8394,12 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
+         if (!sc->cenc.aes_ctx) {
+             return AVERROR(ENOMEM);
+         }
++    }
+ 
+-        ret = av_aes_init(sc->cenc.aes_ctx, c->decryption_key, 16 * 8, 1);
+-        if (ret < 0) {
+-            return ret;
+-        }
++    /* Always reinit with correct key for this sample (multi-key support) */
++    ret = av_aes_init(sc->cenc.aes_ctx, key, 16 * 8, 1);
++    if (ret < 0) {
++        return ret;
+     }
+ 
+     /* whole-block full sample encryption */
+@@ -11650,6 +11725,7 @@ static const AVOption mov_options[] = {
+         AV_OPT_TYPE_BINARY, {.str="77214d4b196a87cd520045fd20a51d67"},
+         .flags = AV_OPT_FLAG_DECODING_PARAM },
+     { "decryption_key", "The media decryption key (hex)", OFFSET(decryption_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
++    { "decryption_keys", "Multi-key decryption (KID:KEY,KID2:KEY2 format)", OFFSET(decryption_keys), AV_OPT_TYPE_DICT, .flags = AV_OPT_FLAG_DECODING_PARAM },
+     { "enable_drefs", "Enable external track support.", OFFSET(enable_drefs), AV_OPT_TYPE_BOOL,
+         {.i64 = 0}, 0, 1, FLAGS },
+     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },

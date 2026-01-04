@@ -372,6 +372,7 @@ typedef struct MOVContext {
     struct AVAES *aes_decrypt;
     uint8_t *decryption_key;
     int decryption_key_len;
+    AVDictionary *decryption_keys;  /* KID => KEY dictionary for multi-key CENC */
     int enable_drefs;
     int32_t movie_display_matrix[3][3]; ///< display matrix from mvhd
     int have_read_mfra_size;
