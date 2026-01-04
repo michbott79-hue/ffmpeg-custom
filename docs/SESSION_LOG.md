@@ -10,18 +10,36 @@
 - [x] Creare repository GitHub
 - [x] Configurare struttura progetto
 - [x] Clonare FFmpeg ufficiale
-- [ ] Prima compilazione di test
+- [x] Prima compilazione di test
 
 ### Attività Svolte
-- Creato repository `ffmpeg-custom` su GitHub
+- Installato GitHub CLI (`gh`) con Homebrew
+- Creato repository `ffmpeg-custom` su GitHub: https://github.com/michbott79-hue/ffmpeg-custom
 - Inizializzata struttura directory (patches/, docs/, scripts/, tests/)
 - Configurato CLAUDE.md con istruzioni progetto
+- Clonato FFmpeg ufficiale (master)
+- Installate dipendenze: nasm, yasm, x264, x265, libvpx, opus, openssl, libxml2
+- Prima compilazione completata con successo
+
+### Build Info
+```
+ffmpeg version git-2026-01-04-521209b
+Configuration: --enable-gpl --enable-version3 --enable-nonfree
+               --enable-libx264 --enable-libx265 --enable-libvpx
+               --enable-libopus --enable-openssl --enable-libxml2
+```
+
+### Funzionalità Verificate
+- DASH muxer/demuxer: ✓
+- HLS muxer/demuxer: ✓
+- Codec: x264, x265, libvpx, opus
 
 ### Stato Fine Sessione
 - **Branch attivo:** `main`
-- **Prossimi step:** Clonare FFmpeg, configurare upstream, prima build
+- **FFmpeg compilato:** `ffmpeg/ffmpeg`
+- **Prossimi step:** Aggiungere supporto CENC decryption
 
 ### Note
-Prima sessione di setup del progetto.
+Setup iniziale completato. FFmpeg compila correttamente.
 
 ---
