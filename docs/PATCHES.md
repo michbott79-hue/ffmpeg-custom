@@ -9,6 +9,7 @@
 | ID | Nome | Descrizione | Data | Stato |
 |----|------|-------------|------|-------|
 | 001 | cenc-multikey-decrypt | Supporto multi-key CENC (KID:KEY,KID2:KEY2) | 2026-01-04 | Applicata |
+| 002 | http-proxy-preemptive-auth | Fix autenticazione proxy preemptive | 2026-01-04 | Applicata |
 
 ---
 
@@ -42,6 +43,24 @@
 
 # Singola chiave (retrocompatibile)
 ./ffmpeg -cenc_decryption_key "0123456789abcdef0123456789abcdef" -i input.mpd -c copy output.mp4
+```
+
+---
+
+### 002-http-proxy-preemptive-auth.patch
+
+**Descrizione:** Fix per autenticazione HTTP proxy con invio preemptive delle credenziali.
+
+**Problema risolto:** Alcuni proxy inviano `Proxy-Authenticate: Basic` senza spazio finale, causando fallimento del parser reattivo di FFmpeg.
+
+**Soluzione:** Invio preemptivo dell'header `Proxy-Authorization` alla prima richiesta CONNECT.
+
+**File modificati:**
+- `libavformat/http.c` - Aggiunta logica preemptive auth in `http_proxy_open()`
+
+**Uso:**
+```bash
+./ffmpeg -http_proxy 'http://user:pass@proxy:port' -i https://... -c copy output.mp4
 ```
 
 ---
