@@ -1,0 +1,118 @@
+diff --git a/ffmpeg/libavformat/http.c b/ffmpeg/libavformat/http.c
+index bd25a45..835733f 100644
+--- a/ffmpeg/libavformat/http.c
++++ b/ffmpeg/libavformat/http.c
+@@ -39,6 +39,7 @@
+ #include "libavutil/opt.h"
+ #include "libavutil/time.h"
+ #include "libavutil/parseutils.h"
++#include "libavutil/base64.h"
+ 
+ #include "avformat.h"
+ #include "http.h"
+@@ -47,6 +48,7 @@
+ #include "network.h"
+ #include "os_support.h"
+ #include "url.h"
++#include "urldecode.h"
+ #include "version.h"
+ 
+ /* XXX: POST protocol is not completely implemented because ffmpeg uses
+@@ -2138,6 +2140,9 @@ static int http_proxy_open(URLContext *h, const char *uri, int flags)
+     int port, ret = 0, auth_attempts = 0;
+     HTTPAuthType cur_auth_type;
+     char *authstr;
++    char *authstr_preemptive = NULL;
++    int auth_b64_len, auth_hdr_len;
++    char *decoded_auth, *ptr;
+ 
+     if( s->seekable == 1 )
+         h->is_streamed = 0;
+@@ -2151,6 +2156,25 @@ static int http_proxy_open(URLContext *h, const char *uri, int flags)
+     if (*path == '/')
+         path++;
+ 
++    /* Preemptive Basic authentication - send Proxy-Authorization on first request.
++     * This fixes compatibility with proxies that send "Proxy-Authenticate: Basic"
++     * without a trailing space, which FFmpeg's reactive auth parser doesn't handle. */
++    if (auth[0] && strchr(auth, ':')) {
++        decoded_auth = ff_urldecode(auth, 0);
++        if (decoded_auth) {
++            auth_b64_len = AV_BASE64_SIZE(strlen(decoded_auth));
++            auth_hdr_len = auth_b64_len + 40;
++            authstr_preemptive = av_malloc(auth_hdr_len);
++            if (authstr_preemptive) {
++                snprintf(authstr_preemptive, auth_hdr_len, "Proxy-Authorization: Basic ");
++                ptr = authstr_preemptive + strlen(authstr_preemptive);
++                av_base64_encode(ptr, auth_b64_len, (const uint8_t *)decoded_auth, strlen(decoded_auth));
++                av_strlcat(authstr_preemptive, "\r\n", auth_hdr_len);
++            }
++            av_free(decoded_auth);
++        }
++    }
++
+     ff_url_join(lower_url, sizeof(lower_url), "tcp", NULL, hostname, port,
+                 NULL);
+ redo:
+@@ -2158,19 +2182,35 @@ redo:
+                                &h->interrupt_callback, NULL,
+                                h->protocol_whitelist, h->protocol_blacklist, h);
+     if (ret < 0)
+-        return ret;
++        goto fail;
++
++    /* Use preemptive auth on first attempt, reactive auth on retry */
++    if (auth_attempts == 0 && authstr_preemptive) {
++        authstr = authstr_preemptive;
++        authstr_preemptive = NULL;  /* Transfer ownership */
++    } else {
++        authstr = ff_http_auth_create_response(&s->proxy_auth_state, auth,
++                                               path, "CONNECT");
++        /* ff_http_auth_create_response returns "Authorization: ..." need to prefix with Proxy- */
++        if (authstr) {
++            size_t old_len = strlen(authstr);
++            char *new_authstr = av_malloc(old_len + 7);  /* "Proxy-" = 6 + null */
++            if (new_authstr) {
++                snprintf(new_authstr, old_len + 7, "Proxy-%s", authstr);
++                av_free(authstr);
++                authstr = new_authstr;
++            }
++        }
++    }
+ 
+-    authstr = ff_http_auth_create_response(&s->proxy_auth_state, auth,
+-                                           path, "CONNECT");
+     snprintf(s->buffer, sizeof(s->buffer),
+              "CONNECT %s HTTP/1.1\r\n"
+              "Host: %s\r\n"
+-             "Connection: close\r\n"
+-             "%s%s"
++             "%s"
+              "\r\n",
+              path,
+              hoststr,
+-             authstr ? "Proxy-" : "", authstr ? authstr : "");
++             authstr ? authstr : "");
+     av_freep(&authstr);
+ 
+     if ((ret = ffurl_write(s->hd, s->buffer, strlen(s->buffer))) < 0)
+@@ -2203,11 +2243,18 @@ redo:
+         goto redo;
+     }
+ 
+-    if (s->http_code < 400)
++    if (s->http_code < 400) {
++        av_freep(&authstr_preemptive);
++        /* Reset filesize after successful CONNECT tunnel.
++         * The proxy may respond with Content-Length: 0 which sets filesize to 0,
++         * but we need unlimited reading for the TLS tunnel that follows. */
++        s->filesize = UINT64_MAX;
+         return 0;
++    }
+     ret = ff_http_averror(s->http_code, AVERROR(EIO));
+ 
+ fail:
++    av_freep(&authstr_preemptive);
+     http_proxy_close(h);
+     return ret;
+ }

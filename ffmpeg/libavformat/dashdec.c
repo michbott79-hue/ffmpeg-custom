@@ -1958,15 +1958,15 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
                 pair = av_strtok(NULL, ",", &saveptr);
             }
 
-            /* Build decryption_keys string for mov demuxer */
+            /* Build decryption_keys string for mov demuxer (FFmpeg dict format: key=value:key2=value2) */
             if (keys_dict) {
                 const AVDictionaryEntry *e = NULL;
                 char keys_opt[4096] = {0};
                 int pos = 0;
                 while ((e = av_dict_iterate(keys_dict, e))) {
                     if (pos > 0)
-                        pos += snprintf(keys_opt + pos, sizeof(keys_opt) - pos, ",");
-                    pos += snprintf(keys_opt + pos, sizeof(keys_opt) - pos, "%s:%s", e->key, e->value);
+                        pos += snprintf(keys_opt + pos, sizeof(keys_opt) - pos, ":");
+                    pos += snprintf(keys_opt + pos, sizeof(keys_opt) - pos, "%s=%s", e->key, e->value);
                 }
                 if (pos > 0)
                     av_dict_set(&in_fmt_opts, "decryption_keys", keys_opt, 0);
